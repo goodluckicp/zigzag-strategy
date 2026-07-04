@@ -49,7 +49,7 @@ SYMBOLS = [
     {'coin_key': 'bitcoin',   'name': 'BTC',  'market': 'okx'},
     {'coin_key': 'ethereum',  'name': 'ETH',  'market': 'okx'},
     {'coin_key': 'near',      'name': 'NEAR', 'market': 'okx'},
-    {'coin_key': 'wld',       'name': 'WLD',  'market': 'okx'},
+    {'coin_key': 'trump',     'name': 'TRUMP', 'market': 'okx'},
 ]
 
 # RSI 参数（和 Pine Script 一致）
