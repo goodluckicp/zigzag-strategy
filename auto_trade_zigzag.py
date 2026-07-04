@@ -1,16 +1,21 @@
 """
-OKX 模拟盘自动交易 · ZigZag++ 策略（多空双向）
-=================================================
+OKX 模拟盘自动交易 · ZigZag++ 多币种策略（多空双向）
+=====================================================
 基于 MT4 ZigZag 算法，检测市场结构（HH/LH/HL/LL）和方向反转。
 
-策略逻辑：
-- ZigZag 方向从空转多（direction > 0）→ 开多
-- ZigZag 方向从多转空（direction < 0）→ 开空
-- 反向信号 → 先平仓再反手开仓
-- HH/HL（看多结构）+ 持空 → 风控平空
-- LH/LL（看空结构）+ 持多 → 风控平多
+支持的币种：
+- BTC-USDT-SWAP  15分钟K线  Depth=12 Deviation=5 Backstep=2
+- ETH-USDT-SWAP   5分钟K线  Depth=8  Deviation=3 Backstep=2
+- NEAR-USDT-SWAP  5分钟K线  Depth=8  Deviation=3 Backstep=2
 
-ZigZag 参数：Depth=12, Deviation=5, Backstep=2
+策略逻辑（每个币种独立运行）：
+- ZigZag 方向转多 → 开多
+- ZigZag 方向转空 → 开空
+- 反向信号 → 平仓后反手开仓
+- HH/HL + 持空 → 风控平空
+- LH/LL + 持多 → 风控平多
+
+每个币种用 10% 资金，5x 杠杆，双向持仓模式。
 
 运行方式（Mac 终端）：
   pip3 install requests numpy websocket-client
@@ -26,6 +31,7 @@ import time
 import hmac
 import base64
 import hashlib
+import threading
 from datetime import datetime, timezone
 
 # ============================================================
@@ -35,17 +41,40 @@ API_KEY     = "e2ab057d-db0f-43b0-b450-86ce6d97d7f3"
 SECRET_KEY  = "A2EDD5A639B73ED3FF0039CBB4E5CC21"
 PASSPHRASE  = "Aa610106$"
 
-INST_ID      = 'BTC-USDT-SWAP'
-BAR          = '15m'
+# 多币种配置
+SYMBOLS = [
+    {
+        'inst_id': 'BTC-USDT-SWAP',
+        'bar': '15m',
+        'depth': 12,
+        'deviation': 5,
+        'backstep': 2,
+        'ct_val': 0.01,       # 1张=0.01 BTC
+        'name': 'BTC',
+    },
+    {
+        'inst_id': 'ETH-USDT-SWAP',
+        'bar': '5m',
+        'depth': 8,
+        'deviation': 3,
+        'backstep': 2,
+        'ct_val': 0.1,        # 1张=0.1 ETH
+        'name': 'ETH',
+    },
+    {
+        'inst_id': 'NEAR-USDT-SWAP',
+        'bar': '5m',
+        'depth': 8,
+        'deviation': 3,
+        'backstep': 2,
+        'ct_val': 1,          # 1张=1 NEAR (需确认)
+        'name': 'NEAR',
+    },
+]
 
-# ZigZag 参数（MT4 原版算法）
-DEPTH        = 12       # 极值点搜索范围（K线根数）
-DEVIATION    = 5        # 最小价格变动幅度（点数，BTC合约这里用百分比近似）
-BACKSTEP     = 2        # 回溯步数（防止极值点过密）
-
-KLINE_LIMIT  = 500
-POSITION_RATIO = 0.10   # 每次用 10% 资金
-LEVERAGE     = 5        # 杠杆倍数
+KLINE_LIMIT    = 500
+POSITION_RATIO = 0.10   # 每个币种用 10% 资金
+LEVERAGE       = 5      # 杠杆倍数
 
 # OKX 模拟盘 API
 OKX_REST = 'https://www.okx.com'
@@ -102,8 +131,9 @@ def get_balance():
     return 0.0
 
 
-def get_position():
-    path = f'/api/v5/account/positions?instId={INST_ID}'
+def get_position(inst_id):
+    """查询指定币种的持仓"""
+    path = f'/api/v5/account/positions?instId={inst_id}'
     result = okx_request('GET', path)
     if result and result.get('code') == '0':
         for pos in result.get('data', []):
@@ -127,26 +157,26 @@ def set_position_mode():
         print(f'  ℹ️ 持仓模式设置返回: {result}')
 
 
-def set_leverage():
+def set_leverage(inst_id):
     path = '/api/v5/account/set-leverage'
     for pos_side in ['long', 'short']:
         body = json.dumps({
-            "instId": INST_ID,
+            "instId": inst_id,
             "lever": str(LEVERAGE),
             "mgnMode": "isolated",
             "posSide": pos_side
         })
         result = okx_request('POST', path, body)
         if result and result.get('code') == '0':
-            print(f'  ✓ 杠杆已设置: {LEVERAGE}x ({pos_side} 逐仓)')
+            print(f'  ✓ {inst_id} 杠杆: {LEVERAGE}x ({pos_side})')
         else:
-            print(f'  ℹ️ 杠杆设置({pos_side})返回: {result}')
+            print(f'  ℹ️ {inst_id} 杠杆设置({pos_side}): {result}')
 
 
-def place_order(side, sz, pos_side, reduce_only=False):
+def place_order(inst_id, side, sz, pos_side, reduce_only=False):
     path = '/api/v5/trade/order'
     body_dict = {
-        "instId": INST_ID,
+        "instId": inst_id,
         "tdMode": "isolated",
         "side": side,
         "posSide": pos_side,
@@ -161,51 +191,38 @@ def place_order(side, sz, pos_side, reduce_only=False):
 
     if result and result.get('code') == '0':
         ord_id = result['data'][0].get('ordId', '')
-        print(f'  ✓ 下单成功: {side} {sz}张 posSide={pos_side}  订单ID: {ord_id}')
+        print(f'  ✓ 下单成功: {inst_id} {side} {sz}张 posSide={pos_side}  ID: {ord_id}')
         return True, ord_id
     else:
-        print(f'  ✗ 下单失败:')
+        print(f'  ✗ 下单失败: {inst_id}')
         if result:
             for d in result.get('data', []):
                 print(f'    错误码: {d.get("sCode")}  {d.get("sMsg")}')
-            print(f'    完整返回: {result}')
         return False, result
 
 
-def open_long(sz):
-    return place_order('buy', sz, 'long')
-
-def open_short(sz):
-    return place_order('sell', sz, 'short')
-
-def close_long(sz):
-    return place_order('sell', sz, 'long', reduce_only=True)
-
-def close_short(sz):
-    return place_order('buy', sz, 'short', reduce_only=True)
-
-
-def close_position(pos=None):
+def close_position(inst_id, pos=None):
     if pos is None:
-        pos = get_position()
+        pos = get_position(inst_id)
     if pos is None:
         return False
     pos_size = abs(pos['pos'])
     if pos_size == 0:
         return False
     if pos['posSide'] == 'long':
-        return close_long(pos_size)[0]
+        return place_order(inst_id, 'sell', pos_size, 'long', reduce_only=True)[0]
     elif pos['posSide'] == 'short':
-        return close_short(pos_size)[0]
+        return place_order(inst_id, 'buy', pos_size, 'short', reduce_only=True)[0]
     return False
 
 
-def calc_order_size(price):
+def calc_order_size(price, ct_val):
+    """计算合约张数"""
     bal = get_balance()
     if bal <= 0:
         return 0, bal
     order_value = bal * POSITION_RATIO * LEVERAGE
-    sz = int(order_value / price / 0.01)
+    sz = int(order_value / price / ct_val)
     return sz, bal
 
 
@@ -213,7 +230,9 @@ def calc_order_size(price):
 #  钉钉
 # ============================================================
 def send_dingtalk(title, text):
-    if 'BTC' not in text or 'ZigZag' not in text:
+    # 钉钉关键词: BTC, Pivot, 策略 — 但现在用 ZigZag，关键词可能要调
+    # 保险起见加上所有可能的关键词
+    if not any(k in text for k in ('BTC', 'Pivot', '策略', 'ZigZag')):
         text = f'BTC ZigZag 策略\n{text}'
     payload = {'msgtype': 'markdown', 'markdown': {'title': title, 'text': text}}
     try:
@@ -227,7 +246,7 @@ def send_dingtalk(title, text):
         print(f'  ✗ 钉钉失败: {e}')
 
 
-def fmt_trade(action, price, sz, balance, ts, extra=''):
+def fmt_trade(sym_name, action, price, sz, balance, ts, extra=''):
     emoji_map = {
         'OPEN_LONG':  '🟢 开多',
         'OPEN_SHORT': '🔴 开空',
@@ -235,11 +254,11 @@ def fmt_trade(action, price, sz, balance, ts, extra=''):
         'CLOSE_SHORT':'🟡 平空',
     }
     emoji = emoji_map.get(action, action)
-    return f"""## BTC ZigZag 策略 · {emoji}（模拟盘）
+    return f"""## {sym_name} ZigZag 策略 · {emoji}（模拟盘）
 
-**标的**: {INST_ID} {BAR}
+**标的**: {sym_name}
 **动作**: {emoji}
-**价格**: ${price:,.2f}
+**价格**: ${price:,.4f}
 **数量**: {sz} 张
 **账户余额**: ${balance:,.2f}
 {extra}
@@ -247,59 +266,35 @@ def fmt_trade(action, price, sz, balance, ts, extra=''):
 **触发时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ---
-> 由 ZigZag++ · OKX 模拟盘自动交易（双向）"""
+> 由 ZigZag++ · OKX 模拟盘自动交易（多币种双向）"""
 
 
 # ============================================================
 #  ZigZag 算法（MT4 原版 Python 移植）
 # ============================================================
 def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
-    """
-    MT4 ZigZag 算法实现
-
-    参数:
-        high: 高价数组
-        low: 低价数组
-        depth: 极值点搜索范围（K线根数）
-        deviation: 最小价格变动幅度（百分比，BTC用0.5%等）
-        backstep: 回溯步数
-
-    返回:
-        zigzag_points: [(index, price, type), ...]  type='H'(高点) 或 'L'(低点)
-        direction: 当前方向 (1=向上, -1=向下)
-        structure: 最新结构标签 ('HH'/'LH'/'HL'/'LL' 或 None)
-    """
     n = len(high)
     if n < depth + backstep + 1:
         return [], 0, None
 
-    # deviation 转成百分比阈值（BTC 价格较高，用百分比更合理）
-    # MT4 里 deviation 是点数，这里用价格的百分比近似
-    dev_threshold = deviation * 0.0001  # 5 -> 0.05% （可调）
+    dev_threshold = deviation * 0.0001
 
-    # Step 1: 计算 HighMapBuffer 和 LowMapBuffer
     high_map = np.zeros(n)
     low_map = np.zeros(n)
 
     for i in range(depth, n):
-        # 在 [i-depth, i] 范围内找最高点
         window_high = high[i - depth: i + 1]
         val_high = np.max(window_high)
-        # 在 [i-depth, i] 范围内找最低点
         window_low = low[i - depth: i + 1]
         val_low = np.min(window_low)
 
-        # 记录高点（如果当前K线的最高价就是窗口最高）
         if high[i] == val_high:
-            # 检查 deviation：与上一个记录的高点比较
             last_high = 0.0
             for back in range(1, min(backstep + 1, i + 1)):
                 if high_map[i - back] != 0:
                     last_high = high_map[i - back]
                     break
-
             if last_high == 0 or abs(val_high - last_high) >= last_high * dev_threshold:
-                # 回溯清除更近的、但不如当前高的高点
                 for back in range(1, min(backstep + 1, i + 1)):
                     if high_map[i - back] != 0 and high_map[i - back] < val_high:
                         high_map[i - back] = 0.0
@@ -309,14 +304,12 @@ def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
         else:
             high_map[i] = 0.0
 
-        # 记录低点（如果当前K线的最低价就是窗口最低）
         if low[i] == val_low:
             last_low = 0.0
             for back in range(1, min(backstep + 1, i + 1)):
                 if low_map[i - back] != 0:
                     last_low = low_map[i - back]
                     break
-
             if last_low == 0 or abs(val_low - last_low) >= last_low * dev_threshold:
                 for back in range(1, min(backstep + 1, i + 1)):
                     if low_map[i - back] != 0 and low_map[i - back] > val_low:
@@ -327,9 +320,7 @@ def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
         else:
             low_map[i] = 0.0
 
-    # Step 2: 从 HighMap 和 LowMap 筛选最终 ZigZag 点
-    zigzag_points = []
-    # 高低点候选
+    # 筛选最终 ZigZag 点
     candidates = []
     for i in range(n):
         if high_map[i] != 0:
@@ -337,24 +328,17 @@ def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
         if low_map[i] != 0:
             candidates.append((i, low_map[i], 'L'))
 
-    # 合并并按时间排序，交替选取高点和低点
     if not candidates:
         return [], 0, None
 
-    # 按时间排序
     candidates.sort(key=lambda x: x[0])
 
-    # 交替选取：高点之后选低点，低点之后选高点
-    # 同类型的取极值（多个连续高点取最高，连续低点取最低）
     filtered = []
     last_type = None
     i = 0
     while i < len(candidates):
         idx_i, price_i, type_i = candidates[i]
-
         if last_type is None:
-            # 第一个点
-            # 合并连续同类型点
             j = i
             best_idx, best_price = idx_i, price_i
             while j < len(candidates) and candidates[j][2] == type_i:
@@ -371,7 +355,6 @@ def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
             continue
 
         if type_i == last_type:
-            # 同类型，取极值并更新
             if type_i == 'H':
                 if price_i > filtered[-1][1]:
                     filtered[-1] = (idx_i, price_i, type_i)
@@ -380,8 +363,6 @@ def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
                     filtered[-1] = (idx_i, price_i, type_i)
             i += 1
         else:
-            # 类型变化，添加新点
-            # 合并连续同类型
             j = i
             best_idx, best_price = idx_i, price_i
             while j < len(candidates) and candidates[j][2] == type_i:
@@ -397,58 +378,215 @@ def calc_zigzag(high, low, depth=12, deviation=5, backstep=2):
             i = j
 
     zigzag_points = filtered
-
     if len(zigzag_points) < 2:
         return zigzag_points, 0, None
 
-    # Step 3: 计算方向和结构标签
-    # 方向：最后一个点是高点 → direction=1（向上），最后一个点是低点 → direction=-1（向下）
     last_point = zigzag_points[-1]
-    prev_point = zigzag_points[-2] if len(zigzag_points) >= 2 else None
-
     direction = 1 if last_point[2] == 'H' else -1
 
-    # 结构标签：比较最近两个同类型极值点
     structure = None
     same_type_points = [p for p in zigzag_points if p[2] == last_point[2]]
     if len(same_type_points) >= 2:
         prev_same = same_type_points[-2]
         curr_same = same_type_points[-1]
         if last_point[2] == 'H':
-            # 比较高点
             structure = 'HH' if curr_same[1] > prev_same[1] else 'LH'
         else:
-            # 比较低点
             structure = 'HL' if curr_same[1] > prev_same[1] else 'LL'
 
     return zigzag_points, direction, structure
 
 
 # ============================================================
-#  信号检测
+#  单币种交易器
 # ============================================================
-def check_signals(klines):
-    """
-    返回:
-        direction: 当前 ZigZag 方向 (1=多, -1=空, 0=未知)
-        direction_changed: 方向是否刚发生变化
-        structure: 最新结构 ('HH'/'LH'/'HL'/'LL' 或 None)
-        structure_changed: 结构是否刚出现新的
-        price: 当前价格
-        zigzag_points: ZigZag 转折点列表
-    """
-    if len(klines) < DEPTH + BACKSTEP + 10:
-        return 0, False, None, False, 0, []
+class SymbolTrader:
+    """每个币种一个独立的交易器实例"""
 
-    high  = np.array([float(k[2]) for k in klines])
-    low   = np.array([float(k[3]) for k in klines])
-    close = np.array([float(k[4]) for k in klines])
+    def __init__(self, config):
+        self.inst_id    = config['inst_id']
+        self.bar        = config['bar']
+        self.depth      = config['depth']
+        self.deviation  = config['deviation']
+        self.backstep   = config['backstep']
+        self.ct_val     = config['ct_val']
+        self.name       = config['name']
 
-    price = close[-1]
+        self.klines          = []
+        self.last_direction  = None
+        self.last_structure  = None
+        self.last_kline_time = None
 
-    zigzag_points, direction, structure = calc_zigzag(high, low, DEPTH, DEVIATION, BACKSTEP)
+    def fetch_history(self):
+        """拉取历史 K 线"""
+        try:
+            params = {'instId': self.inst_id, 'bar': self.bar, 'limit': str(KLINE_LIMIT)}
+            r = requests.get(f'{OKX_REST}/api/v5/market/candles', params=params, timeout=15)
+            data = r.json()
+            if data.get('code') == '0':
+                raw = data['data']
+                raw.reverse()
+                self.klines = [[k[0], k[1], k[2], k[3], k[4], k[5]] for k in raw]
+                print(f'  ✓ {self.name} 获取 {len(self.klines)} 根 K 线 ({self.bar})')
+                return True
+            else:
+                print(f'  ✗ {self.name} K线获取失败: {data}')
+                return False
+        except Exception as e:
+            print(f'  ✗ {self.name} K线获取失败: {e}')
+            return False
 
-    return direction, structure, price, zigzag_points
+    def init_state(self):
+        """用历史K线初始化方向状态"""
+        if len(self.klines) < self.depth + self.backstep + 10:
+            return
+        high = np.array([float(k[2]) for k in self.klines])
+        low  = np.array([float(k[3]) for k in self.klines])
+        _, direction, structure = calc_zigzag(high, low, self.depth, self.deviation, self.backstep)
+        self.last_direction = direction
+        self.last_structure = structure
+        dir_str = "多↑" if direction > 0 else "空↓" if direction < 0 else "未知"
+        print(f'  {self.name} 当前方向: {dir_str}  结构: {structure or "无"}')
+
+    def update_kline(self, item):
+        """更新 K 线数据，返回是否为新收盘 K 线"""
+        ts = item[0]
+        o, h, l, c = item[1], item[2], item[3], item[4]
+        confirm = item[5] if len(item) > 5 else '0'
+
+        if self.klines and self.klines[-1][0] == ts:
+            self.klines[-1] = [ts, o, h, l, c, item[5] if len(item) > 5 else '0']
+        else:
+            self.klines.append([ts, o, h, l, c, item[5] if len(item) > 5 else '0'])
+
+        if confirm != '1':
+            return None
+        if len(self.klines) > KLINE_LIMIT + 10:
+            self.klines.pop(0)
+        if self.last_kline_time == ts:
+            return None
+        self.last_kline_time = ts
+        return ts
+
+    def on_kline_close(self, ts):
+        """K线收盘时执行策略，返回是否产生了交易"""
+        kline_time = datetime.fromtimestamp(int(ts) / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        print(f'\n[{datetime.now().strftime("%H:%M:%S")}] {self.name} K线收盘: {kline_time}')
+
+        if len(self.klines) < self.depth + self.backstep + 10:
+            print(f'  {self.name} K线不足，跳过')
+            return False
+
+        high  = np.array([float(k[2]) for k in self.klines])
+        low   = np.array([float(k[3]) for k in self.klines])
+        close = np.array([float(k[4]) for k in self.klines])
+        price = close[-1]
+
+        zz_points, direction, structure = calc_zigzag(high, low, self.depth, self.deviation, self.backstep)
+        print(f'  {self.name} ${price:,.4f}  方向: {"多↑" if direction>0 else "空↓" if direction<0 else "?"}  结构: {structure or "无"}')
+
+        # 查询当前持仓
+        position = get_position(self.inst_id)
+        cur_side = position['posSide'] if position else None
+        traded = False
+
+        # =========================================================
+        #  1. 方向变化 → 开仓/反手
+        # =========================================================
+        direction_changed = (self.last_direction is not None and direction != self.last_direction and direction != 0)
+
+        if direction_changed:
+            dir_str = "多↑" if direction > 0 else "空↓"
+            print(f'  → {self.name} 方向变化: {dir_str}  (持仓: {cur_side or "空"})')
+
+            if direction > 0:
+                if cur_side == 'long':
+                    print(f'  {self.name} 已持多仓，跳过')
+                else:
+                    if cur_side == 'short':
+                        print(f'  {self.name} 反手: 先平空...')
+                        close_position(self.inst_id, position)
+                        time.sleep(0.5)
+                        send_dingtalk(f'🟡 {self.name} 平空 @ {price}',
+                            fmt_trade(self.name, 'CLOSE_SHORT', price, abs(position['pos']), get_balance(), kline_time,
+                                      f'**策略**: ZigZag 方向转多，反手平空'))
+
+                    sz, bal = calc_order_size(price, self.ct_val)
+                    if sz > 0 and bal > 0:
+                        ok, oid = place_order(self.inst_id, 'buy', sz, 'long')
+                        if ok:
+                            text = fmt_trade(self.name, 'OPEN_LONG', price, sz, bal, kline_time,
+                                             f'**策略**: ZigZag 方向转多')
+                            send_dingtalk(f'🟢 {self.name} 开多 {sz}张 @ {price}', text)
+                            cur_side = 'long'
+                            traded = True
+
+            elif direction < 0:
+                if cur_side == 'short':
+                    print(f'  {self.name} 已持空仓，跳过')
+                else:
+                    if cur_side == 'long':
+                        print(f'  {self.name} 反手: 先平多...')
+                        close_position(self.inst_id, position)
+                        time.sleep(0.5)
+                        send_dingtalk(f'🔵 {self.name} 平多 @ {price}',
+                            fmt_trade(self.name, 'CLOSE_LONG', price, abs(position['pos']), get_balance(), kline_time,
+                                      f'**策略**: ZigZag 方向转空，反手平多'))
+
+                    sz, bal = calc_order_size(price, self.ct_val)
+                    if sz > 0 and bal > 0:
+                        ok, oid = place_order(self.inst_id, 'sell', sz, 'short')
+                        if ok:
+                            text = fmt_trade(self.name, 'OPEN_SHORT', price, sz, bal, kline_time,
+                                             f'**策略**: ZigZag 方向转空')
+                            send_dingtalk(f'🔴 {self.name} 开空 {sz}张 @ {price}', text)
+                            cur_side = 'short'
+                            traded = True
+
+        # =========================================================
+        #  2. 结构变化 → 风控平仓
+        # =========================================================
+        structure_changed = (structure is not None and structure != self.last_structure)
+
+        if structure_changed:
+            print(f'  → {self.name} 新结构: {structure}')
+
+            if structure in ('LH', 'LL') and cur_side == 'long':
+                print(f'  → {self.name} 风控平多: {structure}')
+                pos = get_position(self.inst_id)
+                if pos:
+                    ok = close_position(self.inst_id, pos)
+                    if ok:
+                        bal = get_balance()
+                        extra = f'**策略**: ZigZag 结构 {structure}（风控平多）'
+                        text = fmt_trade(self.name, 'CLOSE_LONG', price, abs(pos['pos']), bal, kline_time, extra)
+                        send_dingtalk(f'🔵 {self.name} 风控平多 {structure} @ {price}', text)
+                        cur_side = None
+                        traded = True
+
+            elif structure in ('HH', 'HL') and cur_side == 'short':
+                print(f'  → {self.name} 风控平空: {structure}')
+                pos = get_position(self.inst_id)
+                if pos:
+                    ok = close_position(self.inst_id, pos)
+                    if ok:
+                        bal = get_balance()
+                        extra = f'**策略**: ZigZag 结构 {structure}（风控平空）'
+                        text = fmt_trade(self.name, 'CLOSE_SHORT', price, abs(pos['pos']), bal, kline_time, extra)
+                        send_dingtalk(f'🟡 {self.name} 风控平空 {structure} @ {price}', text)
+                        cur_side = None
+                        traded = True
+
+        # 更新状态
+        if direction != 0:
+            self.last_direction = direction
+        if structure is not None:
+            self.last_structure = structure
+
+        if not direction_changed and not structure_changed:
+            print(f'  {self.name} 无交易信号')
+
+        return traded
 
 
 # ============================================================
@@ -458,12 +596,12 @@ def main():
     import websocket
 
     print('=' * 60)
-    print('  OKX 模拟盘自动交易 · ZigZag++ 策略（多空双向）')
+    print('  OKX 模拟盘自动交易 · ZigZag++ 多币种策略（多空双向）')
     print('  ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     print('=' * 60)
-    print(f'  标的: {INST_ID} {BAR}')
-    print(f'  ZigZag: Depth={DEPTH}  Deviation={DEVIATION}  Backstep={BACKSTEP}')
-    print(f'  仓位: {POSITION_RATIO*100}%  杠杆: {LEVERAGE}x')
+    for s in SYMBOLS:
+        print(f'  {s["name"]:4s} {s["inst_id"]:16s} {s["bar"]:4s}  Depth={s["depth"]} Dev={s["deviation"]} Back={s["backstep"]}')
+    print(f'  仓位: 每币种 {POSITION_RATIO*100}%  杠杆: {LEVERAGE}x')
     print(f'  模式: 双向持仓 (long_short_mode)')
     print(f'  环境: OKX 模拟盘（虚拟资金）')
     print('=' * 60)
@@ -480,16 +618,34 @@ def main():
         print('\n设置持仓模式...')
         set_position_mode()
         print('\n设置合约杠杆...')
-        set_leverage()
+        for s in SYMBOLS:
+            set_leverage(s['inst_id'])
+
+    # 创建每个币种的交易器
+    traders = {}
+    for s in SYMBOLS:
+        traders[s['inst_id']] = SymbolTrader(s)
+
+    # 拉取历史 K 线
+    print('\n拉取历史 K 线...')
+    for s in SYMBOLS:
+        traders[s['inst_id']].fetch_history()
+
+    # 初始化方向状态
+    print('\n初始化 ZigZag 状态...')
+    for s in SYMBOLS:
+        traders[s['inst_id']].init_state()
 
     # 推送启动消息
-    send_dingtalk('✅ ZigZag++ 模拟盘已启动', f"""## BTC ZigZag 策略 · 模拟盘自动交易启动
+    symbol_list = '\n'.join([f'- {s["name"]} {s["bar"]} D={s["depth"]}/Dev={s["deviation"]}/B={s["backstep"]}' for s in SYMBOLS])
+    send_dingtalk('✅ ZigZag++ 多币种已启动', f"""## BTC ZigZag 策略 · 多币种模拟盘启动
 
-**标的**: {INST_ID} {BAR}
+**币种**:
+{symbol_list}
+
 **环境**: OKX 模拟盘（虚拟资金）
 **模式**: 双向持仓
-**ZigZag**: Depth={DEPTH}  Deviation={DEVIATION}  Backstep={BACKSTEP}
-**仓位**: {POSITION_RATIO*100}%  杠杆: {LEVERAGE}x
+**仓位**: 每币种 {POSITION_RATIO*100}%  杠杆: {LEVERAGE}x
 **账户余额**: ${balance:,.2f} USDT
 **启动时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
@@ -502,43 +658,12 @@ def main():
 
 > ⚠️ 模拟盘环境，使用虚拟资金""")
 
-    # 拉取历史 K 线
-    print('\n拉取历史 K 线...')
-    klines = []
-    try:
-        params = {'instId': INST_ID, 'bar': BAR, 'limit': str(KLINE_LIMIT)}
-        r = requests.get(f'{OKX_REST}/api/v5/market/candles', params=params, timeout=15)
-        data = r.json()
-        if data.get('code') == '0':
-            raw = data['data']
-            raw.reverse()
-            klines = [[k[0], k[1], k[2], k[3], k[4], k[5]] for k in raw]
-            print(f'  ✓ 获取 {len(klines)} 根 K 线')
-        else:
-            print(f'  ✗ K线获取失败: {data}')
-            return
-    except Exception as e:
-        print(f'  ✗ 失败: {e}')
-        return
-
-    # 初始化上次状态
-    last_direction = None
-    last_structure = None
-    last_kline_time = None
-
-    # 先用历史K线计算当前方向
-    if len(klines) >= DEPTH + BACKSTEP + 10:
-        high  = np.array([float(k[2]) for k in klines])
-        low   = np.array([float(k[3]) for k in klines])
-        _, direction, structure = calc_zigzag(high, low, DEPTH, DEVIATION, BACKSTEP)
-        last_direction = direction
-        last_structure = structure
-        print(f'\n  当前 ZigZag 方向: {"多↑" if direction > 0 else "空↓" if direction < 0 else "未知"}')
-        print(f'  当前结构: {structure or "无"}')
+    # 构建订阅消息（一次订阅所有币种）
+    sub_args = []
+    for s in SYMBOLS:
+        sub_args.append({"channel": f"candle{s['bar'].lower()}", "instId": s['inst_id']})
 
     def on_message(ws, message):
-        nonlocal last_direction, last_structure, last_kline_time
-
         if message == 'pong':
             return
         try:
@@ -548,133 +673,21 @@ def main():
         if 'data' not in data:
             return
 
+        # 确定是哪个币种的数据
+        channel_info = data.get('arg', {})
+        inst_id = channel_info.get('instId', '')
+
+        if inst_id not in traders:
+            return
+
+        trader = traders[inst_id]
+
         for item in data['data']:
-            ts = item[0]
-            o, h, l, c = item[1], item[2], item[3], item[4]
-            confirm = item[5] if len(item) > 5 else '0'
-
-            if klines and klines[-1][0] == ts:
-                klines[-1] = [ts, o, h, l, c, item[5] if len(item) > 5 else '0']
-            else:
-                klines.append([ts, o, h, l, c, item[5] if len(item) > 5 else '0'])
-
-            if confirm != '1':
+            ts = trader.update_kline(item)
+            if ts is None:
                 continue
-            if len(klines) > KLINE_LIMIT + 10:
-                klines.pop(0)
-            if last_kline_time == ts:
-                continue
-            last_kline_time = ts
-
-            kline_time = datetime.fromtimestamp(int(ts) / 1000).strftime('%Y-%m-%d %H:%M:%S')
-            print(f'\n[{datetime.now().strftime("%H:%M:%S")}] K线收盘: {kline_time}')
-
-            # 计算 ZigZag
-            direction, structure, price, zz_points = check_signals(klines)
-            print(f'  价格: ${price:,.2f}')
-            print(f'  ZigZag方向: {"多↑" if direction > 0 else "空↓" if direction < 0 else "未知"}  结构: {structure or "无"}')
-            if len(zz_points) >= 2:
-                print(f'  最近转折点: {zz_points[-1][2]} ${zz_points[-1][1]:,.2f}')
-
-            # 查询当前持仓
-            position = get_position()
-            cur_side = position['posSide'] if position else None
-
-            # =========================================================
-            #  1. 方向变化 → 开仓/反手
-            # =========================================================
-            direction_changed = (last_direction is not None and direction != last_direction and direction != 0)
-
-            if direction_changed:
-                dir_str = "多↑" if direction > 0 else "空↓"
-                print(f'  → ZigZag 方向变化: {dir_str}  (当前持仓: {cur_side or "空"})')
-
-                if direction > 0:
-                    # 方向转多 → 开多
-                    if cur_side == 'long':
-                        print('  已持多仓，跳过')
-                    else:
-                        if cur_side == 'short':
-                            print('  反手: 先平空仓...')
-                            close_position(position)
-                            time.sleep(1)
-                            send_dingtalk(f'🟡 平空 @ {price}',
-                                fmt_trade('CLOSE_SHORT', price, abs(position['pos']), get_balance(), kline_time,
-                                          f'**策略**: ZigZag 方向转多，反手平空'))
-
-                        sz, bal = calc_order_size(price)
-                        if sz > 0 and bal > 0:
-                            ok, oid = open_long(sz)
-                            if ok:
-                                text = fmt_trade('OPEN_LONG', price, sz, bal, kline_time,
-                                                 f'**策略**: ZigZag 方向转多')
-                                send_dingtalk(f'🟢 开多 {sz}张 @ {price}', text)
-                                cur_side = 'long'
-
-                elif direction < 0:
-                    # 方向转空 → 开空
-                    if cur_side == 'short':
-                        print('  已持空仓，跳过')
-                    else:
-                        if cur_side == 'long':
-                            print('  反手: 先平多仓...')
-                            close_position(position)
-                            time.sleep(1)
-                            send_dingtalk(f'🔵 平多 @ {price}',
-                                fmt_trade('CLOSE_LONG', price, abs(position['pos']), get_balance(), kline_time,
-                                          f'**策略**: ZigZag 方向转空，反手平多'))
-
-                        sz, bal = calc_order_size(price)
-                        if sz > 0 and bal > 0:
-                            ok, oid = open_short(sz)
-                            if ok:
-                                text = fmt_trade('OPEN_SHORT', price, sz, bal, kline_time,
-                                                 f'**策略**: ZigZag 方向转空')
-                                send_dingtalk(f'🔴 开空 {sz}张 @ {price}', text)
-                                cur_side = 'short'
-
-            # =========================================================
-            #  2. 结构变化 → 风控平仓
-            # =========================================================
-            structure_changed = (structure is not None and structure != last_structure)
-
-            if structure_changed:
-                print(f'  → 新结构: {structure}')
-
-                # LH/LL 是看空结构，有多仓则平
-                if structure in ('LH', 'LL') and cur_side == 'long':
-                    print(f'  → 风控平多: {structure}')
-                    pos = get_position()
-                    if pos:
-                        ok = close_position(pos)
-                        if ok:
-                            bal = get_balance()
-                            extra = f'**策略**: ZigZag 结构 {structure}（风控平多）'
-                            text = fmt_trade('CLOSE_LONG', price, abs(pos['pos']), bal, kline_time, extra)
-                            send_dingtalk(f'🔵 风控平多 {structure} @ {price}', text)
-                            cur_side = None
-
-                # HH/HL 是看多结构，有空仓则平
-                elif structure in ('HH', 'HL') and cur_side == 'short':
-                    print(f'  → 风控平空: {structure}')
-                    pos = get_position()
-                    if pos:
-                        ok = close_position(pos)
-                        if ok:
-                            bal = get_balance()
-                            extra = f'**策略**: ZigZag 结构 {structure}（风控平空）'
-                            text = fmt_trade('CLOSE_SHORT', price, abs(pos['pos']), bal, kline_time, extra)
-                            send_dingtalk(f'🟡 风控平空 {structure} @ {price}', text)
-                            cur_side = None
-
-            # 更新状态
-            if direction != 0:
-                last_direction = direction
-            if structure is not None:
-                last_structure = structure
-
-            if not direction_changed and not structure_changed:
-                print('  无交易信号')
+            # 新 K 线收盘，执行策略
+            trader.on_kline_close(ts)
 
     def on_error(ws, error):
         msg = str(error)
@@ -687,9 +700,9 @@ def main():
         print(f'\n  ⚠️ WebSocket 断开 (code={close_status})，3秒后自动重连...')
 
     def on_open(ws):
-        sub = {"op": "subscribe", "args": [{"channel": f"candle{BAR.lower()}", "instId": INST_ID}]}
+        sub = {"op": "subscribe", "args": sub_args}
         ws.send(json.dumps(sub))
-        print('\n  ✓ WebSocket 已连接，自动交易运行中...\n')
+        print('\n  ✓ WebSocket 已连接，多币种自动交易运行中...\n')
 
     def on_ping(ws, message):
         try:
@@ -698,8 +711,6 @@ def main():
             pass
 
     # ---- 应用层心跳 ----
-    import threading
-
     def heartbeat(ws_ref, stop_event):
         while not stop_event.wait(15):
             ws = ws_ref[0]
