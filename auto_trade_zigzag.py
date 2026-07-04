@@ -117,8 +117,12 @@ def okx_request(method, path, body=''):
 
 
 # ============================================================
-#  账户 & 下单（双向持仓模式）
+#  账户 & 下单（自动适配单向/双向持仓模式）
 # ============================================================
+# 全局变量：当前账户持仓模式，启动时自动检测
+POS_MODE = 'net_mode'  # 或 'long_short_mode'
+
+
 def get_balance():
     result = okx_request('GET', '/api/v5/account/balance')
     if result and result.get('code') == '0':
@@ -129,6 +133,19 @@ def get_balance():
     else:
         print(f'  ⚠️ 查询余额返回: {result}')
     return 0.0
+
+
+def detect_position_mode():
+    """检测当前账户持仓模式"""
+    global POS_MODE
+    result = okx_request('GET', '/api/v5/account/config')
+    if result and result.get('code') == '0':
+        pos_mode = result.get('data', [{}])[0].get('posMode', 'net_mode')
+        POS_MODE = pos_mode
+        print(f'  ✓ 当前持仓模式: {POS_MODE}')
+    else:
+        print(f'  ⚠️ 无法检测持仓模式，默认 net_mode: {result}')
+    return POS_MODE
 
 
 def get_position(inst_id):
@@ -148,38 +165,66 @@ def get_position(inst_id):
 
 
 def set_position_mode():
+    """尝试设置双向持仓模式，如果失败就保持当前模式"""
     path = '/api/v5/account/set-position-mode'
     body = json.dumps({"posMode": "long_short_mode"})
     result = okx_request('POST', path, body)
     if result and result.get('code') == '0':
-        print(f'  ✓ 持仓模式: 双向 (long_short_mode)')
+        global POS_MODE
+        POS_MODE = 'long_short_mode'
+        print(f'  ✓ 持仓模式已设为: 双向 (long_short_mode)')
     else:
         print(f'  ℹ️ 持仓模式设置返回: {result}')
 
 
 def set_leverage(inst_id):
+    """根据当前持仓模式设置杠杆"""
     path = '/api/v5/account/set-leverage'
-    for pos_side in ['long', 'short']:
+    if POS_MODE == 'long_short_mode':
+        # 双向模式：多空分别设置
+        for pos_side in ['long', 'short']:
+            body = json.dumps({
+                "instId": inst_id,
+                "lever": str(LEVERAGE),
+                "mgnMode": "isolated",
+                "posSide": pos_side
+            })
+            result = okx_request('POST', path, body)
+            if result and result.get('code') == '0':
+                print(f'  ✓ {inst_id} 杠杆: {LEVERAGE}x ({pos_side})')
+            else:
+                print(f'  ℹ️ {inst_id} 杠杆设置({pos_side}): {result}')
+    else:
+        # 单向模式：用 net
         body = json.dumps({
             "instId": inst_id,
             "lever": str(LEVERAGE),
             "mgnMode": "isolated",
-            "posSide": pos_side
+            "posSide": "net"
         })
         result = okx_request('POST', path, body)
         if result and result.get('code') == '0':
-            print(f'  ✓ {inst_id} 杠杆: {LEVERAGE}x ({pos_side})')
+            print(f'  ✓ {inst_id} 杠杆: {LEVERAGE}x (net 单向)')
         else:
-            print(f'  ℹ️ {inst_id} 杠杆设置({pos_side}): {result}')
+            print(f'  ℹ️ {inst_id} 杠杆设置(net): {result}')
 
 
 def place_order(inst_id, side, sz, pos_side, reduce_only=False):
+    """
+    下单
+    pos_side 会根据当前 POS_MODE 自动调整，如果传 long/short 但当前是 net_mode，则强制改为 net
+    """
     path = '/api/v5/trade/order'
+
+    actual_pos_side = pos_side
+    if POS_MODE == 'net_mode':
+        actual_pos_side = 'net'
+
     body_dict = {
         "instId": inst_id,
         "tdMode": "isolated",
         "side": side,
-        "posSide": pos_side,
+        "posSide": actual_pos_side,
         "ordType": "market",
         "sz": str(sz)
     }
@@ -191,7 +236,7 @@ def place_order(inst_id, side, sz, pos_side, reduce_only=False):
 
     if result and result.get('code') == '0':
         ord_id = result['data'][0].get('ordId', '')
-        print(f'  ✓ 下单成功: {inst_id} {side} {sz}张 posSide={pos_side}  ID: {ord_id}')
+        print(f'  ✓ 下单成功: {inst_id} {side} {sz}张 posSide={actual_pos_side}  ID: {ord_id}')
         return True, ord_id
     else:
         print(f'  ✗ 下单失败: {inst_id}')
@@ -201,7 +246,22 @@ def place_order(inst_id, side, sz, pos_side, reduce_only=False):
         return False, result
 
 
+def open_long(inst_id, sz):
+    """开多"""
+    if POS_MODE == 'net_mode':
+        return place_order(inst_id, 'buy', sz, 'net')
+    return place_order(inst_id, 'buy', sz, 'long')
+
+
+def open_short(inst_id, sz):
+    """开空"""
+    if POS_MODE == 'net_mode':
+        return place_order(inst_id, 'sell', sz, 'net')
+    return place_order(inst_id, 'sell', sz, 'short')
+
+
 def close_position(inst_id, pos=None):
+    """平仓"""
     if pos is None:
         pos = get_position(inst_id)
     if pos is None:
@@ -209,10 +269,17 @@ def close_position(inst_id, pos=None):
     pos_size = abs(pos['pos'])
     if pos_size == 0:
         return False
-    if pos['posSide'] == 'long':
-        return place_order(inst_id, 'sell', pos_size, 'long', reduce_only=True)[0]
-    elif pos['posSide'] == 'short':
-        return place_order(inst_id, 'buy', pos_size, 'short', reduce_only=True)[0]
+
+    if POS_MODE == 'net_mode':
+        # 单向模式：pos>0 是多仓，pos<0 是空仓
+        side = 'sell' if pos['pos'] > 0 else 'buy'
+        return place_order(inst_id, side, pos_size, 'net', reduce_only=True)[0]
+    else:
+        # 双向模式
+        if pos['posSide'] == 'long':
+            return place_order(inst_id, 'sell', pos_size, 'long', reduce_only=True)[0]
+        elif pos['posSide'] == 'short':
+            return place_order(inst_id, 'buy', pos_size, 'short', reduce_only=True)[0]
     return False
 
 
@@ -485,9 +552,15 @@ class SymbolTrader:
         zz_points, direction, structure = calc_zigzag(high, low, self.depth, self.deviation, self.backstep)
         print(f'  {self.name} ${price:,.4f}  方向: {"多↑" if direction>0 else "空↓" if direction<0 else "?"}  结构: {structure or "无"}')
 
-        # 查询当前持仓
+        # 查询当前持仓（兼容 net_mode 和 long_short_mode）
         position = get_position(self.inst_id)
-        cur_side = position['posSide'] if position else None
+        cur_side = None
+        if position:
+            if POS_MODE == 'net_mode':
+                # 单向模式：pos > 0 视为多仓，pos < 0 视为空仓
+                cur_side = 'long' if position['pos'] > 0 else 'short'
+            else:
+                cur_side = position['posSide']
         traded = False
 
         # =========================================================
@@ -615,8 +688,8 @@ def main():
         print('  ⚠️  余额为 0，请先在 OKX 模拟交易页面充值虚拟资金')
         print('  继续运行（仅监控信号，不下单）...')
     else:
-        print('\n设置持仓模式...')
-        set_position_mode()
+        print('\n检测持仓模式...')
+        detect_position_mode()
         print('\n设置合约杠杆...')
         for s in SYMBOLS:
             set_leverage(s['inst_id'])
