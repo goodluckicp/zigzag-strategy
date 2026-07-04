@@ -60,6 +60,9 @@ RSI_LENGTH     = 7
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD   = 30
 
+# Pivot Points 参数（LuxAlgo Pivot Points High Low）
+PIVOT_LENGTH   = 50   # Pivot 回溯长度（日线图约2个月）
+
 # 检查间隔（秒）
 CHECK_INTERVAL = 3600  # 每小时检查一次
 
@@ -251,6 +254,63 @@ def detect_rsi_swing(klines):
 
 
 # ============================================================
+#  Pivot Points 信号检测（LuxAlgo Pivot Points High Low）
+# ============================================================
+def detect_pivot_points(klines, length=50):
+    """
+    检测 Pivot Points 信号
+
+    Pine Script 逻辑：
+    - ta.pivothigh(length, length): 前 length 根和后 length 根都低于中间点 → 高点
+    - ta.pivotlow(length, length): 前 length 根和后 length 根都高于中间点 → 低点
+
+    信号：
+    - Pivot High (▼) → 卖出信号
+    - Pivot Low  (▲) → 买入信号
+
+    返回:
+        pivot_signals: [(type, price, date_str, bar_index), ...]
+        latest_pivot: 最近的 pivot (type, price, date_str) 或 None
+    """
+    if len(klines) < length * 2 + 1:
+        return [], None
+
+    high  = np.array([k[2] for k in klines])
+    low   = np.array([k[3] for k in klines])
+    n = len(high)
+
+    pivot_signals = []
+
+    # Pine Script 的 pivothigh/pivotlow:
+    # 在 bar i 处，检查 high[i] 是否是 [i-length, i+length] 范围内的最高点
+    # 注意：pivothigh 在 i+length 时刻才能确认（需要后面 length 根 K 线）
+    for i in range(length, n - length):
+        # Pivot High: high[i] 是 [i-length, i+length] 范围内最高
+        window_high = high[i - length: i + length + 1]
+        if high[i] == np.max(window_high) and high[i] > 0:
+            # 确认这个高点不是平顶（唯一最高）
+            count_max = np.sum(window_high == high[i])
+            if count_max == 1:
+                date_str = datetime.fromtimestamp(
+                    klines[i][0] / 1000, tz=timezone(timedelta(hours=8))
+                ).strftime('%Y-%m-%d')
+                pivot_signals.append(('PH', high[i], date_str, i))
+
+        # Pivot Low: low[i] 是 [i-length, i+length] 范围内最低
+        window_low = low[i - length: i + length + 1]
+        if low[i] == np.min(window_low) and low[i] > 0:
+            count_min = np.sum(window_low == low[i])
+            if count_min == 1:
+                date_str = datetime.fromtimestamp(
+                    klines[i][0] / 1000, tz=timezone(timedelta(hours=8))
+                ).strftime('%Y-%m-%d')
+                pivot_signals.append(('PL', low[i], date_str, i))
+
+    latest = pivot_signals[-1] if pivot_signals else None
+    return pivot_signals, latest
+
+
+# ============================================================
 #  钉钉通知
 # ============================================================
 def send_dingtalk(title, text):
@@ -305,39 +365,73 @@ def fmt_signal(name, signal_type, price, rsi, date_str, extra=''):
 > RSI长度={RSI_LENGTH} 超买={RSI_OVERBOUGHT} 超卖={RSI_OVERSOLD}"""
 
 
+def fmt_pivot_signal(name, pivot_type, price, date_str, days_ago=0):
+    """格式化 Pivot Points 信号消息"""
+    if pivot_type == 'PL':
+        emoji = '🟢 买入信号'
+        desc = 'Pivot Low (▲)，价格在近期低点反转向上'
+    elif pivot_type == 'PH':
+        emoji = '🔴 卖出信号'
+        desc = 'Pivot High (▼)，价格在近期高点反转向下'
+    else:
+        emoji = pivot_type
+        desc = ''
+
+    days_note = f'\n**距今天数**: {days_ago}天前' if days_ago > 0 else ''
+
+    return f"""## {name} Pivot Points · {emoji}
+
+**币种**: {name}
+**信号**: {emoji}
+**类型**: {"▼ Pivot High" if pivot_type=="PH" else "▲ Pivot Low"}
+**价格**: ${price:,.4f}
+**说明**: {desc}
+**K线日期**: {date_str}{days_note}
+**检测时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+> Pivot Points (LuxAlgo) 波段信号 · 日线
+> Pivot Length={PIVOT_LENGTH}"""
+
+
 # ============================================================
 #  主程序
 # ============================================================
 def main():
     print('=' * 60)
-    print('  RSI Swing 波段信号通知（日线）')
+    print('  波段信号通知（日线）· RSI Swing + Pivot Points')
     print('  ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     print('=' * 60)
     print(f'  币种: {[s["name"] for s in SYMBOLS]}')
     print(f'  周期: 日线（1d）')
-    print(f'  RSI: 长度={RSI_LENGTH} 超买={RSI_OVERBOUGHT} 超卖={RSI_OVERSOLD}')
-    print(f'  信号: HL→买入  LH→卖出  HH/LL→结构标记')
+    print(f'  策略1: RSI Swing (长度={RSI_LENGTH} 超买={RSI_OVERBOUGHT} 超卖={RSI_OVERSOLD})')
+    print(f'  策略2: Pivot Points (长度={PIVOT_LENGTH})')
     print(f'  检查间隔: {CHECK_INTERVAL}秒')
     print(f'  数据源: AICoin v3 API')
     print('=' * 60)
 
     # 推送启动消息
-    send_dingtalk('✅ RSI Swing 信号已启动', f"""## BTC RSI Swing 策略 · 信号通知启动
+    send_dingtalk('✅ 波段信号已启动', f"""## BTC Pivot 策略 · 双策略信号通知启动
 
 **币种**: {[s["name"] for s in SYMBOLS]}
 **周期**: 日线
-**RSI**: 长度={RSI_LENGTH} 超买={RSI_OVERBOUGHT} 超卖={RSI_OVERSOLD}
 **启动时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-信号规则：
+**策略1: RSI Swing**
 - 🟢 HL（更高低点）→ 买入信号
 - 🔴 LH（更低高点）→ 卖出信号
-- 📊 HH/LL → 结构标记（不产生交易信号）
+- 📊 HH/LL → 结构标记
 
-> 日线波段信号，每天收盘后检查""")
+**策略2: Pivot Points (LuxAlgo)**
+- 🟢 ▲ Pivot Low → 买入信号
+- 🔴 ▼ Pivot High → 卖出信号
+- 参数: Length={PIVOT_LENGTH}
+
+> 日线波段信号，每小时检查一次""")
 
     # 记录每个币种上次推送的信号（避免重复推送）
-    last_pushed = {}  # {name: (signal_type, date_str)}
+    # key 格式: f"{strategy}_{sig_type}_{date_str}"
+    last_pushed = set()
 
     while True:
         try:
@@ -352,43 +446,66 @@ def main():
 
                 # 获取日线数据
                 klines = fetch_klines(coin_key, market, '1d', '300')
-                if len(klines) < RSI_LENGTH + 10:
+                if len(klines) < PIVOT_LENGTH * 2 + 10:
                     print(f'  {name} K线不足: {len(klines)}')
                     continue
 
                 print(f'  {name} 获取 {len(klines)} 根日线')
-                print(f'  {name} 最新收盘: ${klines[-1][4]:,.4f}  日期: {datetime.fromtimestamp(klines[-1][0]/1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d")}')
+                latest_date = datetime.fromtimestamp(klines[-1][0]/1000, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d')
+                print(f'  {name} 最新收盘: ${klines[-1][4]:,.4f}  日期: {latest_date}')
 
-                # 检测信号
-                signals, last_struct, rsi_now, price_now = detect_rsi_swing(klines)
+                # =====================================================
+                #  策略1: RSI Swing 信号
+                # =====================================================
+                rsi_signals, rsi_struct, rsi_now, _ = detect_rsi_swing(klines)
 
-                if not signals:
-                    print(f'  {name} RSI={rsi_now:.1f}  暂无结构信号')
-                    continue
+                if rsi_signals:
+                    latest_rsi = rsi_signals[-1]
+                    rsi_type, rsi_price, rsi_date = latest_rsi
+                    print(f'  {name} [RSI Swing] RSI={rsi_now:.1f}  最新: {rsi_type} @ ${rsi_price:,.4f} ({rsi_date})')
 
-                # 取最近的信号
-                latest = signals[-1]
-                sig_type, sig_price, sig_date = latest
+                    push_key = f'rsi_{rsi_type}_{rsi_date}_{name}'
+                    if push_key not in last_pushed:
+                        if rsi_type in ('HL', 'LH', 'HH', 'LL'):
+                            text = fmt_signal(name, rsi_type, rsi_price, rsi_now, rsi_date)
+                            action = '🟢 买入' if rsi_type == 'HL' else '🔴 卖出' if rsi_type == 'LH' else '📊 结构'
+                            send_dingtalk(f'{action} {name} RSI {rsi_type} @ ${rsi_price:,.2f}', text)
+                            last_pushed.add(push_key)
+                    else:
+                        print(f'  {name} [RSI Swing] 已推送过，跳过')
+                else:
+                    print(f'  {name} [RSI Swing] RSI={rsi_now:.1f}  暂无信号')
 
-                print(f'  {name} RSI={rsi_now:.1f}  最新结构: {sig_type} @ ${sig_price:,.4f} ({sig_date})')
+                # =====================================================
+                #  策略2: Pivot Points 信号
+                # =====================================================
+                pivot_signals, latest_pivot = detect_pivot_points(klines, PIVOT_LENGTH)
 
-                # 检查是否已推送过这个信号
-                push_key = (sig_type, sig_date)
-                if last_pushed.get(name) == push_key:
-                    print(f'  {name} 已推送过 {sig_type} ({sig_date})，跳过')
-                    continue
+                if latest_pivot:
+                    pv_type, pv_price, pv_date = latest_pivot
+                    print(f'  {name} [Pivot] 最新: {"▼ High" if pv_type=="PH" else "▲ Low"} @ ${pv_price:,.4f} ({pv_date})')
 
-                # 只推送交易信号（HL=买入, LH=卖出），HH/LL 只记录不推送
-                if sig_type in ('HL', 'LH'):
-                    action = '🟢 买入' if sig_type == 'HL' else '🔴 卖出'
-                    text = fmt_signal(name, sig_type, sig_price, rsi_now, sig_date)
-                    send_dingtalk(f'{action} {name} {sig_type} @ ${sig_price:,.2f}', text)
-                    last_pushed[name] = push_key
-                elif sig_type in ('HH', 'LL'):
-                    # 结构标记也推送，但不那么紧急
-                    text = fmt_signal(name, sig_type, sig_price, rsi_now, sig_date)
-                    send_dingtalk(f'📊 {name} {sig_type} @ ${sig_price:,.2f}', text)
-                    last_pushed[name] = push_key
+                    push_key = f'pivot_{pv_type}_{pv_date}_{name}'
+                    if push_key not in last_pushed:
+                        # 只推送最近 5 天内的 pivot 信号
+                        try:
+                            pv_dt = datetime.strptime(pv_date, '%Y-%m-%d')
+                            days_ago = (datetime.now() - pv_dt).days
+                        except:
+                            days_ago = 999
+
+                        if days_ago <= 5:
+                            text = fmt_pivot_signal(name, pv_type, pv_price, pv_date, days_ago)
+                            action = '🟢 买入' if pv_type == 'PL' else '🔴 卖出'
+                            send_dingtalk(f'{action} {name} Pivot {"▼" if pv_type=="PH" else "▲"} @ ${pv_price:,.2f}', text)
+                            last_pushed.add(push_key)
+                        else:
+                            print(f'  {name} [Pivot] 信号太久 ({days_ago}天前)，跳过')
+                            last_pushed.add(push_key)
+                    else:
+                        print(f'  {name} [Pivot] 已推送过，跳过')
+                else:
+                    print(f'  {name} [Pivot] 暂无信号')
 
             print(f'\n[{datetime.now().strftime("%H:%M:%S")}] 检查完成，{CHECK_INTERVAL}秒后再次检查...')
 
