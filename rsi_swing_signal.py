@@ -482,7 +482,7 @@ def main():
                 pivot_signals, latest_pivot = detect_pivot_points(klines, PIVOT_LENGTH)
 
                 if latest_pivot:
-                    pv_type, pv_price, pv_date = latest_pivot
+                    pv_type, pv_price, pv_date, _ = latest_pivot
                     print(f'  {name} [Pivot] 最新: {"▼ High" if pv_type=="PH" else "▲ Low"} @ ${pv_price:,.4f} ({pv_date})')
 
                     push_key = f'pivot_{pv_type}_{pv_date}_{name}'
