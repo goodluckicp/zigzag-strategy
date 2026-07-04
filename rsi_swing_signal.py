@@ -251,7 +251,10 @@ def detect_rsi_swing(klines):
 #  钉钉通知
 # ============================================================
 def send_dingtalk(title, text):
-    """推送到钉钉"""
+    """推送到钉钉，确保包含关键词"""
+    # 钉钉关键词要求：BTC, Pivot, 策略
+    if not all(k in title or k in text for k in ['BTC', 'Pivot', '策略']):
+        text = f'BTC Pivot 策略\n{text}'
     payload = {'msgtype': 'markdown', 'markdown': {'title': title, 'text': text}}
     try:
         r = requests.post(DINGTALK_WEBHOOK, json=payload, timeout=10)
