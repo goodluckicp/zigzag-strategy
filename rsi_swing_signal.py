@@ -50,6 +50,9 @@ SYMBOLS = [
     {'coin_key': 'ethereum',  'name': 'ETH',  'market': 'okx'},
     {'coin_key': 'near',      'name': 'NEAR', 'market': 'okx'},
     {'coin_key': 'trump',     'name': 'TRUMP', 'market': 'okx'},
+    {'coin_key': 'ena',       'name': 'ENA',   'market': 'okx'},
+    {'coin_key': 'icp',       'name': 'ICP',   'market': 'okx'},
+    {'coin_key': 'filecoin',  'name': 'FIL',   'market': 'okx'},
 ]
 
 # RSI 参数（和 Pine Script 一致）
